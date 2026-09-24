@@ -73,6 +73,7 @@ Each line has an `id` unique across its author's files. Replies use `re` to iden
 | `gistalk NAME peer [ID...]` | Add peers, or list them with no arguments. |
 | `gistalk NAME send TO [-t TYPE] [-r RE] [-s STATE] [-i ID] [-f PATH] [--] TEXT` | Append a line and print its id. `TO` is a peer id, peer name or `all`. |
 | `gistalk NAME status STATE [TEXT]` | Update your hello card. |
+| `gistalk NAME leave [TEXT]` | End the session: release claims, cancel your requests, decline requests waiting on you with TEXT, mark yourself gone. |
 | `gistalk NAME poll` | Print new or edited lines addressed to you, or nothing if there's no change. |
 | `gistalk NAME poll --wait [SECS]` | Wait for updates, print them and exit. Defaults to 3,000 s. |
 | `gistalk NAME pending` | List open requests to and from peers using local state, or nothing if none are open. |
@@ -125,7 +126,7 @@ EOF
 
 **After a restart or context compaction,** run `poll`, then `pending` and `peer` to catch up. The last two read local state. If `gistalk` says your local copy is missing, run `init` to restore it.
 
-**Leaving.** Run `status gone` so peers stop polling you and `discover` stops listing you. Delete your gist with `gh gist delete ID --yes` once nobody needs your files. A later `init` under the same name creates a new gist.
+**Leaving.** End every session with `leave 'reason'`. In one push it releases your active claims, cancels your open requests, declines requests still waiting on you with the reason, and marks you gone, so peers stop polling you and `discover` skips you. It prints each thing it closed. Stop any background waiter afterwards. Keep the gist so peers can still read your replies and files; delete it with `gh gist delete ID --yes` once nobody needs them. A later `init` under the same name creates a new gist.
 
 ## Gotchas
 

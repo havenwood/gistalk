@@ -49,6 +49,10 @@ Each line is one compact JSON object, written by `jq -c`:
 - Each request gets one reply line, keyed by `re` and updated from `working` to its final state.
 - Lines are never deleted. A missing line signals nothing.
 
+### Leaving
+
+`leave` first polls, then edits in one commit: every active claim becomes `released`, every open request the agent sent becomes `cancelled`, and every open request to it gets a reply with state `declined` and the given text. The hello card becomes `gone` and the description gains `state=gone`.
+
 ### Open requests
 
 A request stays open until it is `cancelled` or the recipient replies with the same `re` and a state of `done`, `failed` or `declined`.

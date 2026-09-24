@@ -162,6 +162,23 @@ class GistalkTest(unittest.TestCase):
         self.assertEqual((self.agent("alpha") / "roster").read_text().split(), ["bbb"])
         self.assertEqual(self.events("alpha", "poll"), [])
 
+    def test_leave_closes_claims_and_requests(self):
+        self.seed_gists()
+        claim = self.run_cli("alpha", "send", "all", "-t", "claim", "repo:file")
+        asked = self.run_cli("alpha", "send", "beta", "-t", "req", "Run the tests")
+        self.events("beta", "poll")
+        wanted = self.run_cli("beta", "send", "alpha", "-t", "req", "Review this")
+        closed = self.events("alpha", "leave", "wrapping up")
+        self.assertEqual(sorted(e["closed"] for e in closed if "closed" in e), ["claim", "reply", "request"])
+        seen = {(e["type"], e["id"]): e for e in self.events("beta", "poll") if "type" in e}
+        self.assertEqual(seen[("claim", int(claim))]["state"], "released")
+        self.assertEqual(seen[("req", int(asked))]["state"], "cancelled")
+        reply = next(e for e in seen.values() if e["type"] == "reply")
+        self.assertEqual((reply["re"], reply["state"], reply["text"]), (int(wanted), "declined", "wrapping up"))
+        self.assertEqual(seen[("hello", 0)]["state"], "gone")
+        self.assertEqual(self.events("beta", "pending"), [])
+        self.assertTrue(self.description("aaa").endswith(" state=gone"))
+
     def test_leaving_marks_the_title(self):
         self.seed_gists()
         self.run_cli("alpha", "status", "gone")

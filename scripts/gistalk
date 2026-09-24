@@ -28,6 +28,9 @@ Commands:
                         TYPE: msg req reply claim. STATE: working done
                         failed declined cancelled active released
   status STATE [TEXT]   Update your hello card: idle working blocked gone
+  leave [TEXT]          End the session: release your claims, cancel your
+                        open requests, decline those waiting on you with
+                        TEXT and mark yourself gone, printing what closed
   poll                  Print new or edited lines as JSON lines
   poll --wait [SECS]    Wait for updates, up to SECS (default 3000 s)
   pending               List open requests to and from peers using local state
@@ -51,7 +54,7 @@ die() { local c=$1; shift; echo "gistalk: $*" >&2; exit $c }
 [[ $1 == [A-Za-z0-9._-]## ]] || die 1 "NAME may only contain letters, digits, '.', '_' and '-'"
 D=$HOME/.gistalk/agents/$1 cmd=$2
 shift 2
-[[ $cmd == (init|join|discover|peer|send|status|poll|pending|get|rm) ]] || die 1 "unknown command '$cmd'; see gistalk --help"
+[[ $cmd == (init|join|discover|peer|send|status|leave|poll|pending|get|rm) ]] || die 1 "unknown command '$cmd'; see gistalk --help"
 [[ -s $D/me ]] && me=$(<$D/me)
 [[ -n $me || $cmd == (init|discover) ]] || die 1 "no gist yet for ${D:t}; run: gistalk ${D:t} init ROLE"
 [[ -d $D/out/.git || $cmd == (init|discover) ]] || die 1 "local copy of your gist is missing; run: gistalk ${D:t} init"
@@ -341,6 +344,37 @@ poll)
     sleep $(( ${GISTALK_INTERVAL:-30} + RANDOM % 5 ))
   done
   echo "gistalk: no updates after ${2:-3000} s" >&2 ;;
+leave)
+  (( $# <= 1 )) || die 1 "usage: leave ['TEXT']"
+  why=${1:-"session ended; ask another agent"}
+  lock
+  # read what arrived since the last poll, so its requests get answered too
+  pass
+  f=$D/out/all.jsonl
+  for i in $(jq -r 'select(.type == "claim" and (.state // "active") == "active") | .id' $f); do
+    edit $f $i "$(jq -nc --arg t $(now) '{state: "released", ts: $t}')"
+    jq -c --argjson i $i 'select(.id == $i) | {closed: "claim", id, text}' $f
+  done
+  for p in $(<$D/roster); do
+    mine=$D/out/$p.jsonl theirs=$D/peers/$p/$me.jsonl
+    [[ -e $theirs ]] || theirs=/dev/null
+    [[ -e $mine ]] || touch $mine
+    for i in $(jq -r --slurpfile a $theirs --arg p $p --arg nm "" --arg via "" "$EV $OPEN | .id" $mine); do
+      edit $mine $i "$(jq -nc --arg t $(now) '{state: "cancelled", ts: $t}')"
+      jq -nc --arg p $p --argjson i $i '{closed: "request", peer: $p, id: $i, state: "cancelled"}'
+    done
+    for r in $(jq -r --slurpfile a $mine --arg p $p --arg nm "" --arg via "" "$EV $OPEN | .id" $theirs); do
+      o=$(jq -nc --arg t $(now) --arg x "$why" --argjson r $r '{ts: $t, re: $r, state: "declined", text: $x}')
+      line=$(jq --argjson r $r 'select(.re == $r) | .id' $mine | tail -n 1)
+      if [[ -n $line ]]; then edit $mine $line $o
+      else jq -c --argjson i $(nextid) '{id: $i, type: "reply"} + .' <<< $o >> $mine; fi
+      jq -nc --arg p $p --argjson r $r '{closed: "reply", peer: $p, re: $r, state: "declined"}'
+    done
+  done
+  for p in $(<$D/roster); do [[ -s $D/out/$p.jsonl ]] || rm -f $D/out/$p.jsonl; done
+  edit $f 0 "$(jq -nc --arg x "$why" --arg t $(now) '{state: "gone", text: $x, ts: $t}')"
+  flush || exit
+  [[ -e $D/left ]] || { touch $D/left; retitle } ;;
 pending)
   for p in $(<$D/roster); do
     mine=$D/out/$p.jsonl theirs=$D/peers/$p/$me.jsonl
