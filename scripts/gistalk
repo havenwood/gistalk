@@ -1,0 +1,250 @@
+#!/usr/bin/env zsh
+emulate -L zsh
+setopt extendedglob pipefail
+zmodload zsh/system zsh/datetime
+
+usage() {
+  cat <<'EOF'
+Usage: gistalk NAME COMMAND [ARGS]
+
+Connect with other agents through GitHub gists. NAME is your local handle;
+state lives in ~/.gistalk/agents/NAME.
+
+Commands:
+  init ROLE             Create your secret gist and print its id. Run again
+                        to print the id, restore local state or replace
+                        a deleted gist
+  peer [ID|URL...]      Add peers, or list them as JSON lines with no arguments
+  send TO [-t TYPE] [-r RE] [-s STATE] [-i ID] [-f PATH] [--] TEXT|-
+                        Send to a peer id, peer name or "all" and print the
+                        line id. -i edits your line ID. -r adds or updates
+                        your reply to RE. -f shares a file.
+                        Pass - as TEXT to read from stdin.
+                        TYPE: msg req reply claim. STATE: working done
+                        failed declined cancelled active released
+  status STATE [TEXT]   Update your hello card: idle working blocked gone
+  poll                  Print new or edited lines as JSON lines
+  poll --wait [SECS]    Wait for updates, up to SECS (default 3000 s)
+  pending               List open requests to and from peers using local state
+  get PEER FILE [DEST]  Download a peer's shared file
+  rm FILE               Remove one of your shared files
+
+Exit codes: 0 success, 1 invalid input, 2 GitHub unreachable or authentication failed,
+4 push failed (saved locally; next command retries), 5 not found
+
+Examples:
+  gistalk alpha init "api test runner"
+  gistalk alpha send 9313c57f5e85d164d75c94a7c1e8b789 -t req 'run the specs'
+  gistalk alpha send beta -r 12 -s done -f spec.log '2 failures, log attached'
+EOF
+}
+
+die() { local c=$1; shift; echo "gistalk: $*" >&2; exit $c }
+[[ ${1-} == (-h|--help|help) ]] && { usage; exit 0 }
+(( $# >= 2 )) || { usage >&2; exit 1 }
+[[ $1 == [A-Za-z0-9._-]## ]] || die 1 "NAME may only contain letters, digits, '.', '_' and '-'"
+D=$HOME/.gistalk/agents/$1 cmd=$2
+shift 2
+[[ $cmd == (init|peer|send|status|poll|pending|get|rm) ]] || die 1 "unknown command '$cmd'; see gistalk --help"
+[[ -s $D/me ]] && me=$(<$D/me)
+[[ -n $me || $cmd == init ]] || die 1 "no gist yet for ${D:t}; run: gistalk ${D:t} init ROLE"
+[[ -d $D/out/.git || $cmd == init ]] || die 1 "local copy of your gist is missing; run: gistalk ${D:t} init"
+mkdir -p $D/peers && touch $D/roster $D/lock
+GIT=(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' -c core.hooksPath=/dev/null
+  -c commit.gpgsign=false -c user.name=gistalk-${D:t} -c user.email=gistalk@localhost)
+EV='def ev: {peer: $p, name: $nm, via: $via} + .;'
+OPEN='select(.type == "req" and .state != "cancelled")
+  | select(.id as $i | any($a[]; .re == $i and (.state | IN("done", "failed", "declined"))) | not) | ev'
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ }
+lock() { zsystem flock -t 120 -f LK $D/lock || die 1 "another gistalk ${D:t} command held the lock for 120 s" }
+nextid() { cat $D/out/(all|[0-9a-f]##).jsonl(N) | jq -s 'map(.id) | max + 1' }
+edit() { jq -c --argjson i $2 --argjson o $3 'if .id == $i then . + $o else . end' $1 > $1.tmp && mv $1.tmp $1 }
+hello() { git -C $D/peers/$1/repo show origin/HEAD:all.jsonl 2>/dev/null | jq -c 'select(.id == 0)' }
+name() { hello $1 | jq -r .name }
+clone() { rm -rf $D/out && $GIT clone -q https://gist.github.com/$1.git $D/out || die 2 "git clone of gist $1 failed" }
+
+fetch() {
+  local P=$D/peers/$1
+  if [[ -d $P/repo ]]; then $GIT -C $P/repo fetch -q 2> $P/err
+  else $GIT clone -q --no-checkout --filter=blob:limit=1m https://gist.github.com/$1.git $P/repo 2> $P/err; fi
+}
+
+resolve() {
+  local p
+  [[ -n $1 ]] || { echo "gistalk: specify a peer" >&2; return 1 }
+  [[ $1 == all ]] && { print all; return }
+  grep -qxF -- "$1" $D/roster && { print $1; return }
+  for p in $(<$D/roster); do [[ $(name $p) == "$1" ]] && { print $p; return }; done
+  echo "gistalk: unknown peer '$1'; add it with peer ID, or run poll to learn peer names" >&2
+  return 5
+}
+
+flush() {
+  local i
+  $GIT -C $D/out add -A && { $GIT -C $D/out diff --cached --quiet || $GIT -C $D/out commit --no-verify -qm "gistalk ${D:t}" } ||
+    { echo "gistalk: git commit failed in $D/out" >&2; return 4 }
+  for i in 1 2 4; do
+    [[ -z $($GIT -C $D/out rev-list '@{u}..HEAD' 2>/dev/null) ]] && return 0
+    $GIT -C $D/out push --no-verify -q origin HEAD 2> $D/push.err && return 0
+    $GIT -C $D/out pull -q --rebase >> $D/push.err 2>&1 || $GIT -C $D/out rebase --abort > /dev/null 2>&1
+    sleep $i
+  done
+  echo "gistalk: push failed ($(grep -v '^hint:' $D/push.err | tail -1)); saved locally for the next command to retry; do not resend" >&2
+  return 4
+}
+
+pass() {
+  local p P nm ch via q new head
+  for p in $(<$D/roster); do
+    P=$D/peers/$p; mkdir -p $P
+    [[ -e $P/gone ]] && continue
+    fetch $p || {
+      grep -qi 'not found' $P/err && { touch $P/gone; jq -nc --arg p $p --arg nm "$(name $p)" '{peer: $p, name: $nm, event: "gone"}' }
+      continue
+    }
+    head=$(git -C $P/repo rev-parse -q --verify origin/HEAD) || continue
+    [[ -s $P/seen && $head == $(<$P/seen) ]] && continue
+    for ch in all $me; do
+      if [[ -n $(git -C $P/repo ls-tree --name-only $head -- $ch.jsonl) ]]; then
+        $GIT -C $P/repo show $head:$ch.jsonl > $P/$ch.new || continue 2
+      else : > $P/$ch.new; fi
+    done
+    nm=$(jq -r 'select(.id == 0) | .name' $P/all.new)
+    for ch via in all all $me direct; do
+      new=; [[ -e $P/$ch.jsonl ]] || { new=1; touch $P/$ch.jsonl }
+      grep -vxFf $P/$ch.jsonl $P/$ch.new | { [[ -n $new && $via == all ]] && tail -n 20 || cat } |
+        jq -c --arg p $p --arg nm "$nm" --arg via $via "$EV ev"
+      mv $P/$ch.new $P/$ch.jsonl
+    done
+    [[ $(jq -r 'select(.id == 0) | .state' $P/all.jsonl) == gone ]] && touch $P/gone
+    for q in $(jq -r 'select(.id == 0) | .peers[]?' $P/all.jsonl); do
+      [[ $q == [0-9a-f]## && $q != $me ]] && ! grep -qxF $q $D/roster && {
+        print $q >> $D/roster
+        jq -nc --arg p $p --arg nm "$nm" --arg q $q '{peer: $p, name: $nm, event: "introduced", new_peer: $q}'
+      }
+    done
+    print $head > $P/seen
+  done
+}
+
+case $cmd in
+init)
+  lock
+  [[ -s $D/me ]] && me=$(<$D/me)
+  if [[ -n $me ]]; then
+    code=$(gh api -i gists/$me --silent 2>/dev/null | head -1 | cut -d' ' -f2)
+    case $code in
+      200) [[ -d $D/out/.git ]] || clone $me; print $me; exit ;;
+      404) echo "gistalk: gist $me no longer exists; creating a new one" >&2; rm -f $D/me ;;
+      *) die 2 "cannot check gist $me (HTTP ${code:-no response}); check the network and gh auth status" ;;
+    esac
+  fi
+  hello=$(jq -nc --arg t $(now) --arg n $D:t --arg r "$*" \
+    '{id: 0, ts: $t, type: "hello", name: $n, role: $r, state: "idle", text: "", peers: []}')
+  id=$(jq -n --arg d "gistalk $D:t" --arg c "$hello"$'\n' \
+    '{public: false, description: $d, files: {"all.jsonl": {content: $c}}}' |
+    gh api -X POST gists --input - --jq .id) || die 2 "could not create gist; run gh auth status and check for the gist scope"
+  clone $id
+  print $id > $D/me && print $id ;;
+peer)
+  if (( ! $# )); then
+    for p in $(<$D/roster); do
+      if [[ -e $D/peers/$p/gone ]]; then jq -nc --arg p $p --arg nm "$(name $p)" '{peer: $p, name: $nm, state: "gone"}'
+      elif [[ -n $(hello $p) ]]; then hello $p | jq -c --arg p $p '{peer: $p, name, state, role, text}'
+      else jq -nc --arg p $p '{peer: $p, state: "not fetched yet"}'; fi
+    done
+    exit
+  fi
+  argv=(${${${${argv%%\#*}%/}:t}%.git})
+  for p; do [[ $p == [0-9a-f]## && $p != $me ]] || die 1 "not a peer gist id: $p"; done
+  lock
+  print -l $(<$D/roster) $@ | sort -u > $D/roster.tmp && mv $D/roster.tmp $D/roster
+  for p; do rm -f $D/peers/$p/gone; mkdir -p $D/peers/$p; fetch $p || echo "gistalk: could not fetch $p yet; poll will retry" >&2; done
+  edit $D/out/all.jsonl 0 "$(jq -nc --rawfile r $D/roster --arg t $(now) '{peers: ($r | split("\n") | map(select(. != ""))), ts: $t}')"
+  flush || exit ;;
+send)
+  zparseopts -D -E t:=ty r:=re s:=sv i:=id f:=fp
+  (( ${argv[(i)--]} <= $# )) && argv[${argv[(i)--]}]=()
+  (( $# == 1 || $# == 2 )) || die 1 "usage: send TO [-t TYPE] [-r RE] [-s STATE] [-i ID] [-f PATH] [--] TEXT|- (put options before - or --)"
+  to=$(resolve $1) || exit
+  text=${2-}; [[ $text == - ]] && text=$(cat)
+  [[ ${ty[2]-} == (|msg|req|reply|claim) ]] || die 1 "-t must be one of: msg req reply claim; got '${ty[2]}'"
+  [[ ${sv[2]-} == (|working|done|failed|declined|cancelled|active|released) ]] ||
+    die 1 "-s must be one of: working done failed declined cancelled active released; got '${sv[2]}'"
+  [[ ${re[2]-}${id[2]-} == [0-9]# ]] || die 1 "-r and -i take numeric line ids"
+  if (( $#fp )); then
+    src=$fp[2] n=$fp[2]:t
+    [[ -f $src ]] || die 5 "no such file: $src"
+    [[ $n != .* && $n != (all|[0-9a-f]##).jsonl ]] || die 1 "cannot share a file named '$n'; rename it"
+  fi
+  lock
+  f=$D/out/$to.jsonl line=${id[2]-}
+  [[ -z $line && -n ${re[2]-} && -e $f ]] && line=$(jq --argjson r $re[2] 'select(.re == $r) | .id' $f | tail -1)
+  if [[ -n $line ]]; then
+    [[ -e $f ]] && jq -e --argjson i $line 'select(.id == $i)' $f > /dev/null || die 5 "you have no line $line in ${f:t}"
+  else
+    [[ -n $text || -n ${n-} ]] || die 1 "add a message or attach a file with -f PATH"
+  fi
+  [[ -n ${n-} ]] && cp $src $D/out/$n
+  o=$(jq -nc --arg ts $(now) --arg t "${ty[2]-}" --arg re "${re[2]-}" --arg s "${sv[2]-}" --arg x "$text" --arg f "${n-}" \
+    '{ts: $ts} + ({type: $t, re: ($re | tonumber? // ""), state: $s, text: $x, file: $f} | with_entries(select(.value != "")))')
+  if [[ -n $line ]]; then edit $f $line $o
+  else
+    line=$(nextid)
+    jq -c --argjson i $line --arg t ${${re[2]:+reply}:-msg} '{id: $i, type: $t} + .' <<< $o >> $f
+  fi
+  flush || exit
+  print $line ;;
+status)
+  [[ $# -le 2 && ${1-} == (idle|working|blocked|gone) ]] || die 1 "usage: status idle|working|blocked|gone ['TEXT']"
+  lock
+  edit $D/out/all.jsonl 0 "$(jq -nc --arg s $1 --arg x "${2-}" --arg t $(now) '{state: $s, text: $x, ts: $t}')"
+  flush || exit ;;
+poll)
+  if [[ ${1-} != --wait ]]; then
+    lock
+    flush
+    pass
+    exit 0
+  fi
+  [[ ${2:-1} == [0-9]## ]] || die 1 "usage: poll --wait [SECS]"
+  touch $D/wait.lock
+  zsystem flock -t 0 -f WL $D/wait.lock 2>/dev/null || { echo "gistalk: already waiting for updates" >&2; exit 0 }
+  end=$(( EPOCHSECONDS + ${2:-3000} ))
+  while (( EPOCHSECONDS < end )); do
+    lock
+    flush
+    pass > $D/events
+    zsystem flock -u $LK
+    [[ -s $D/events ]] && { cat $D/events; exit 0 }
+    sleep $(( ${GISTALK_INTERVAL:-30} + RANDOM % 5 ))
+  done
+  echo "gistalk: no updates after ${2:-3000} s" >&2 ;;
+pending)
+  for p in $(<$D/roster); do
+    mine=$D/out/$p.jsonl theirs=$D/peers/$p/$me.jsonl
+    [[ -e $mine ]] || mine=/dev/null
+    [[ -e $theirs ]] || theirs=/dev/null
+    jq -c --slurpfile a $mine --arg p $p --arg nm "$(name $p)" --arg via waiting-on-me "$EV $OPEN" $theirs
+    jq -c --slurpfile a $theirs --arg p $p --arg nm "$(name $p)" --arg via waiting-on-peer "$EV $OPEN" $mine
+  done ;;
+get)
+  (( $# >= 2 )) || die 1 "usage: get PEER FILE [DEST]"
+  p=$(resolve $1) || exit
+  [[ $p != all ]] || die 1 "get needs a peer, not all"
+  n=$2 dst=${3:-$2} R=$D/peers/$p/repo
+  [[ -d $dst ]] && dst=$dst/${n:t}
+  lock
+  fetch $p || die 5 "could not fetch gist $p"
+  [[ $n == ${n:t} && -n $(git -C $R ls-tree --name-only origin/HEAD -- $n) ]] ||
+    die 5 "no file '$n' in $p; files: $(git -C $R ls-tree --name-only origin/HEAD | tr '\n' ' ')"
+  $GIT -C $R show origin/HEAD:$n > $dst || die 5 "download of $n failed"
+  print $dst ;;
+rm)
+  [[ $# -eq 1 && -n $1 && $1 == ${1:t} && $1 != .* && $1 != (all|[0-9a-f]##).jsonl && -f $D/out/$1 ]] ||
+    die 5 "you have no shared file '${1-}'"
+  lock
+  rm $D/out/$1
+  flush || exit ;;
+esac
