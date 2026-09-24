@@ -11,9 +11,14 @@ Connect with other agents through GitHub gists. NAME is your local handle;
 state lives in ~/.gistalk/agents/NAME.
 
 Commands:
-  init ROLE             Create your secret gist and print its id. Run again
+  init [--room ROOM] ROLE
+                        Create your secret gist and print its id. Run again
                         to print the id, restore local state or replace
-                        a deleted gist
+                        a deleted gist. --room joins ROOM as well
+  join ROOM             Enter ROOM and add its recent agents as peers
+  discover [--room ROOM] [--since HOURS] [--all]
+                        List recent gistalk agents on your GitHub account,
+                        newest first. --all includes agents that left
   peer [ID|URL...]      Add peers, or list them as JSON lines with no arguments
   send TO [-t TYPE] [-r RE] [-s STATE] [-i ID] [-f PATH] [--] TEXT|-
                         Send to a peer id, peer name or "all" and print the
@@ -33,7 +38,8 @@ Exit codes: 0 success, 1 invalid input, 2 GitHub unreachable or authentication f
 4 push failed (saved locally; next command retries), 5 not found
 
 Examples:
-  gistalk alpha init "api test runner"
+  gistalk alpha init --room shop "api test runner"
+  gistalk alpha discover --room shop
   gistalk alpha send 9313c57f5e85d164d75c94a7c1e8b789 -t req 'run the specs'
   gistalk alpha send beta -r 12 -s done -f spec.log '2 failures, log attached'
 EOF
@@ -45,11 +51,12 @@ die() { local c=$1; shift; echo "gistalk: $*" >&2; exit $c }
 [[ $1 == [A-Za-z0-9._-]## ]] || die 1 "NAME may only contain letters, digits, '.', '_' and '-'"
 D=$HOME/.gistalk/agents/$1 cmd=$2
 shift 2
-[[ $cmd == (init|peer|send|status|poll|pending|get|rm) ]] || die 1 "unknown command '$cmd'; see gistalk --help"
+[[ $cmd == (init|join|discover|peer|send|status|poll|pending|get|rm) ]] || die 1 "unknown command '$cmd'; see gistalk --help"
 [[ -s $D/me ]] && me=$(<$D/me)
-[[ -n $me || $cmd == init ]] || die 1 "no gist yet for ${D:t}; run: gistalk ${D:t} init ROLE"
-[[ -d $D/out/.git || $cmd == init ]] || die 1 "local copy of your gist is missing; run: gistalk ${D:t} init"
+[[ -n $me || $cmd == (init|discover) ]] || die 1 "no gist yet for ${D:t}; run: gistalk ${D:t} init ROLE"
+[[ -d $D/out/.git || $cmd == (init|discover) ]] || die 1 "local copy of your gist is missing; run: gistalk ${D:t} init"
 mkdir -p $D/peers && touch $D/roster $D/lock
+GH=(${=GISTALK_GH:-gh})
 GIT=(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' -c core.hooksPath=/dev/null
   -c commit.gpgsign=false -c user.name=gistalk-${D:t} -c user.email=gistalk@localhost)
 EV='def ev: {peer: $p, name: $nm, via: $via} + .;'
@@ -63,6 +70,74 @@ edit() { jq -c --argjson i $2 --argjson o $3 'if .id == $i then . + $o else . en
 hello() { git -C $D/peers/$1/repo show origin/HEAD:all.jsonl 2>/dev/null | jq -c 'select(.id == 0)' }
 name() { hello $1 | jq -r .name }
 clone() { rm -rf $D/out && $GIT clone -q https://gist.github.com/$1.git $D/out || die 2 "git clone of gist $1 failed" }
+
+# Gist descriptions read "gistalk/1 room=R name=N host=H", plus "state=gone"
+# once the agent leaves, so discover can list agents without fetching them.
+title() {
+  local t="gistalk/1"
+  [[ -s $D/room ]] && t+=" room=$(<$D/room)"
+  t+=" name=${D:t} host=${${HOST%%.*}//[^A-Za-z0-9._-]/-}"
+  [[ -e $D/left ]] && t+=" state=gone"
+  print -r -- $t
+}
+retitle() { $GH api -X PATCH gists/$me -f description="$(title)" --silent || die 2 "could not update the description of gist $me" }
+
+# All gistalk gists on the account as JSON lines, newest first. Older
+# "gistalk NAME" descriptions have no room.
+agents() {
+  $GH api --paginate 'gists?per_page=100' --jq '.[] | select(.description // "" | startswith("gistalk"))
+    | {id, updated: .updated_at, d: .description}' |
+    jq -c 'def kv: [scan("([a-z]+)=([A-Za-z0-9._-]+)") | {(.[0]): .[1]}] | add // {};
+      . as $g | ($g.d | if startswith("gistalk/") then kv
+        else {name: (split(" ")[1] // "")} end) as $f
+      | {id: $g.id, name: ($f.name // ""), room: ($f.room // ""), host: ($f.host // ""),
+         state: ($f.state // "active"), updated: $g.updated}' |
+    jq -sc 'sort_by(.updated | fromdateiso8601 | -.) | .[]'
+}
+
+addpeers() {
+  (( $# )) || return 0
+  print -l $(<$D/roster) $@ | sort -u > $D/roster.tmp && mv $D/roster.tmp $D/roster
+  for p; do rm -f $D/peers/$p/gone; mkdir -p $D/peers/$p; fetch $p || echo "gistalk: could not fetch $p yet; poll will retry" >&2; done
+  edit $D/out/all.jsonl 0 "$(jq -nc --rawfile r $D/roster --arg t $(now) '{peers: ($r | split("\n") | map(select(. != ""))), ts: $t}')"
+  flush
+}
+
+# Agents in a room active in the last day, other than us, as JSON lines.
+roommates() {
+  agents | jq -c --arg r $1 --arg me $me --argjson c $(( EPOCHSECONDS - 86400 )) \
+    'select(.room == $r and .id != $me and .state != "gone" and (.updated | fromdateiso8601) >= $c)'
+}
+
+# Enter a room: record it, retitle the gist and add the room's recent agents.
+join() {
+  [[ $1 == [A-Za-z0-9._-]## ]] || die 1 "ROOM may only contain letters, digits, '.', '_' and '-'"
+  print $1 > $D/room
+  retitle
+  local ids=($(roommates $1 | jq -r .id))
+  addpeers $ids || exit
+  print $EPOCHSECONDS > $D/room.checked
+  print -l $ids
+}
+
+# Polls recheck the room every GISTALK_ROOM_INTERVAL seconds, so agents that
+# joined later reach us even though we never read their gist before.
+roomcheck() {
+  [[ -s $D/room ]] || return 0
+  [[ -s $D/room.checked ]] && (( EPOCHSECONDS - $(<$D/room.checked) < ${GISTALK_ROOM_INTERVAL:-600} )) && return 0
+  local found q
+  found=$(roommates $(<$D/room)) || return 0
+  print $EPOCHSECONDS > $D/room.checked
+  local added=0
+  for q in $(jq -r .id <<< $found); do
+    [[ $q == [0-9a-f]## ]] && ! grep -F -x -q -e "$q" "$D/roster" || continue
+    print $q >> $D/roster; mkdir -p $D/peers/$q; added=1
+    jq -c --arg q $q 'select(.id == $q) | {peer: .id, name, event: "joined", room}' <<< $found
+  done
+  (( added )) || return 0
+  edit $D/out/all.jsonl 0 "$(jq -nc --rawfile r $D/roster --arg t $(now) '{peers: ($r | split("\n") | map(select(. != ""))), ts: $t}')"
+  flush >&2
+}
 
 fetch() {
   local P=$D/peers/$1
@@ -96,6 +171,7 @@ flush() {
 
 pass() {
   local p P nm ch via q new head
+  roomcheck
   for p in $(<$D/roster); do
     P=$D/peers/$p; mkdir -p $P
     [[ -e $P/gone ]] && continue
@@ -140,23 +216,44 @@ pass() {
 
 case $cmd in
 init)
+  zparseopts -D -E -room:=ro
+  (( ${argv[(i)--]} <= $# )) && argv[${argv[(i)--]}]=()
   lock
+  rm -f $D/left
   [[ -s $D/me ]] && me=$(<$D/me)
   if [[ -n $me ]]; then
-    code=$(gh api -i gists/$me --silent 2>/dev/null | head -n 1 | cut -d' ' -f2)
+    code=$($GH api -i gists/$me --silent 2>/dev/null | head -n 1 | cut -d' ' -f2)
     case $code in
-      200) [[ -d $D/out/.git ]] || clone $me; print $me; exit ;;
+      200) [[ -d $D/out/.git ]] || clone $me
+        print $me
+        (( $#ro )) && join $ro[2] > /dev/null
+        exit ;;
       404) echo "gistalk: gist $me no longer exists; creating a new one" >&2; rm -f $D/me ;;
       *) die 2 "cannot check gist $me (HTTP ${code:-no response}); check the network and gh auth status" ;;
     esac
   fi
   hello=$(jq -nc --arg t $(now) --arg n $D:t --arg r "$*" \
     '{id: 0, ts: $t, type: "hello", name: $n, role: $r, state: "idle", text: "", peers: []}')
-  id=$(jq -n --arg d "gistalk $D:t" --arg c "$hello"$'\n' \
+  [[ -z ${ro[2]-} || $ro[2] == [A-Za-z0-9._-]## ]] || die 1 "ROOM may only contain letters, digits, '.', '_' and '-'"
+  (( $#ro )) && print $ro[2] > $D/room
+  id=$(jq -n --arg d "$(title)" --arg c "$hello"$'\n' \
     '{public: false, description: $d, files: {"all.jsonl": {content: $c}}}' |
-    gh api -X POST gists --input - --jq .id) || die 2 "could not create gist; run gh auth status and check for the gist scope"
+    $GH api -X POST gists --input - --jq .id) || die 2 "could not create gist; run gh auth status and check for the gist scope"
   clone $id
-  print $id > $D/me && print $id ;;
+  print $id > $D/me && print $id
+  me=$id
+  (( $#ro )) && join $ro[2] > /dev/null
+  : ;;
+join)
+  (( $# == 1 )) || die 1 "usage: join ROOM"
+  lock
+  join $1 ;;
+discover)
+  zparseopts -D -E -room:=ro -since:=since -all=all
+  (( $# == 0 )) || die 1 "usage: discover [--room ROOM] [--since HOURS] [--all]"
+  [[ ${since[2]:-24} == [0-9]## ]] || die 1 "--since takes whole hours"
+  agents | jq -c --arg r "${ro[2]-}" --argjson all ${#all} --argjson c $(( EPOCHSECONDS - ${since[2]:-24} * 3600 )) \
+    'select(($r == "" or .room == $r) and ($all > 0 or .state != "gone") and (.updated | fromdateiso8601) >= $c)' ;;
 peer)
   if (( ! $# )); then
     for p in $(<$D/roster); do
@@ -169,10 +266,7 @@ peer)
   argv=(${${${${argv%%\#*}%/}:t}%.git})
   for p; do [[ $p == [0-9a-f]## && $p != $me ]] || die 1 "not a peer gist id: $p"; done
   lock
-  print -l $(<$D/roster) $@ | sort -u > $D/roster.tmp && mv $D/roster.tmp $D/roster
-  for p; do rm -f $D/peers/$p/gone; mkdir -p $D/peers/$p; fetch $p || echo "gistalk: could not fetch $p yet; poll will retry" >&2; done
-  edit $D/out/all.jsonl 0 "$(jq -nc --rawfile r $D/roster --arg t $(now) '{peers: ($r | split("\n") | map(select(. != ""))), ts: $t}')"
-  flush || exit ;;
+  addpeers $@ || exit ;;
 send)
   zparseopts -D -E t:=ty r:=re s:=sv i:=id f:=fp
   (( ${argv[(i)--]} <= $# )) && argv[${argv[(i)--]}]=()
@@ -211,7 +305,9 @@ status)
   [[ $# -le 2 && ${1-} == (idle|working|blocked|gone) ]] || die 1 "usage: status idle|working|blocked|gone ['TEXT']"
   lock
   edit $D/out/all.jsonl 0 "$(jq -nc --arg s $1 --arg x "${2-}" --arg t $(now) '{state: $s, text: $x, ts: $t}')"
-  flush || exit ;;
+  flush || exit
+  if [[ $1 == gone && ! -e $D/left ]]; then touch $D/left; retitle
+  elif [[ $1 != gone && -e $D/left ]]; then rm $D/left; retitle; fi ;;
 poll)
   if [[ ${1-} != --wait ]]; then
     lock

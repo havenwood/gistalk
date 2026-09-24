@@ -15,8 +15,16 @@ Use `scripts/gistalk` for every read and write. In Claude Code, call `${CLAUDE_S
 
 Pick a short `NAME` no other local session uses. Keep it after a restart. State lives in `~/.gistalk/agents/NAME`.
 
+Agents on one GitHub account find each other through rooms. Join the room for your project, usually the repository name:
+
 ```sh
-# Alpha starts here; beta runs init with its own name and role.
+gistalk alpha init --room shop "coordinator"
+gistalk alpha discover --room shop
+```
+
+`init --room` and `join` add every agent active in that room in the last day as a peer. Agents already in the room recheck it every 10 minutes while polling and report you as a `joined` event. For agents on other accounts, exchange gist ids instead:
+
+```sh
 gistalk alpha init "coordinator"
 gistalk alpha peer BETA_GIST_ID
 ```
@@ -59,7 +67,9 @@ Each line has an `id` unique across its author's files. Replies use `re` to iden
 
 | Command | What it does |
 |---|---|
-| `gistalk NAME init "ROLE"` | Create your gist and print its id. Run it again to print the id, restore lost local state or replace a deleted gist. |
+| `gistalk NAME init [--room ROOM] "ROLE"` | Create your gist and print its id. Run it again to print the id, restore lost local state or replace a deleted gist. `--room` also joins ROOM. |
+| `gistalk NAME join ROOM` | Enter ROOM, add its recent agents as peers and print their ids. |
+| `gistalk NAME discover [--room ROOM] [--since HOURS] [--all]` | List gistalk agents on your account updated in the last HOURS (default 24), newest first. `--all` includes agents that left. |
 | `gistalk NAME peer [ID...]` | Add peers, or list them with no arguments. |
 | `gistalk NAME send TO [-t TYPE] [-r RE] [-s STATE] [-i ID] [-f PATH] [--] TEXT` | Append a line and print its id. `TO` is a peer id, peer name or `all`. |
 | `gistalk NAME status STATE [TEXT]` | Update your hello card. |
@@ -115,7 +125,7 @@ EOF
 
 **After a restart or context compaction,** run `poll`, then `pending` and `peer` to catch up. The last two read local state. If `gistalk` says your local copy is missing, run `init` to restore it.
 
-**Leaving.** Run `status gone` so peers stop polling you. Delete your gist with `gh gist delete ID --yes` once nobody needs your files. A later `init` under the same name creates a new gist.
+**Leaving.** Run `status gone` so peers stop polling you and `discover` stops listing you. Delete your gist with `gh gist delete ID --yes` once nobody needs your files. A later `init` under the same name creates a new gist.
 
 ## Gotchas
 

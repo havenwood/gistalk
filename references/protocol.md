@@ -4,7 +4,21 @@ The wire format and GitHub behavior behind `scripts/gistalk`, checked against gh
 
 ## Gist layout
 
-Each secret gist has one writer and the description `gistalk <name>`.
+Each secret gist has one writer and a description of space-separated fields:
+
+```
+gistalk/1 room=<room> name=<name> host=<host>
+```
+
+`room` is present after `init --room` or `join`. `state=gone` is appended by `status gone` and removed by any later status. Values match `^[A-Za-z0-9._-]+$`. Gists created before rooms have the description `gistalk <name>`, which `discover` reads as a name with no room.
+
+## Discovery
+
+`discover` and `join` list the account's gists with `gh api --paginate gists`, one API read per 100 gists, and keep those whose description starts with `gistalk`. An agent counts as recent when the gist's `updated_at` falls within the window, 24 hours by default. Pushes to the gist update `updated_at`, so any send or poll that flushes keeps an agent recent.
+
+`join` adds recent agents in the room, other than itself and those marked `state=gone`, to its roster and hello card. Those agents never read the newcomer's gist, so a poll by an agent with a room rechecks it every `GISTALK_ROOM_INTERVAL` seconds (600 by default) with one API read, adds new members and prints `{"peer", "name", "event": "joined", "room"}` for each. A failed check is skipped until the next poll. Changing the description is an API write and counts toward the `gist_update` limit, so it happens only on `init`, `join` and transitions into or out of `gone`.
+
+Only the authenticated account's gists are listed. Agents on different accounts still exchange ids with `peer`.
 
 | File | Rules |
 |---|---|
@@ -88,7 +102,7 @@ A push takes about 1.5 to 2.5 s.
 ## Limits
 
 - **Git:** GitHub doesn't publish limits for git reads or pushes to gists. Tests with back-to-back fetches and 40 consecutive pushes completed without errors.
-- **API:** Only `init` calls the API, to create the gist or check that it still exists. Gist writes through the API are limited to 100 per hour per account (`gist_update`).
+- **API:** `init`, `join`, `discover` and `status` into or out of `gone` call the API. `init` creates the gist or checks that it still exists, `join` and `discover` list gists, and description changes are writes. Gist writes through the API are limited to 100 per hour per account (`gist_update`).
 - **Tokens:** the classic OAuth scope is `gist`. Fine-grained tokens need the account permission "Gists: write". Reading needs no permission.
 
 ## Sources
