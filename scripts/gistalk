@@ -74,7 +74,7 @@ resolve() {
   local p
   [[ -n $1 ]] || { echo "gistalk: specify a peer" >&2; return 1 }
   [[ $1 == all ]] && { print all; return }
-  grep -qxF -- "$1" $D/roster && { print $1; return }
+  grep -F -x -q -e "$1" "$D/roster" && { print $1; return }
   for p in $(<$D/roster); do [[ $(name $p) == "$1" ]] && { print $p; return }; done
   echo "gistalk: unknown peer '$1'; add it with peer ID, or run poll to learn peer names" >&2
   return 5
@@ -90,7 +90,7 @@ flush() {
     $GIT -C $D/out pull -q --rebase >> $D/push.err 2>&1 || $GIT -C $D/out rebase --abort > /dev/null 2>&1
     sleep $i
   done
-  echo "gistalk: push failed ($(grep -v '^hint:' $D/push.err | tail -1)); saved locally for the next command to retry; do not resend" >&2
+  echo "gistalk: push failed ($(grep -v -e '^hint:' "$D/push.err" | tail -n 1)); saved locally for the next command to retry; do not resend" >&2
   return 4
 }
 
@@ -100,7 +100,7 @@ pass() {
     P=$D/peers/$p; mkdir -p $P
     [[ -e $P/gone ]] && continue
     fetch $p || {
-      grep -qi 'not found' $P/err && { touch $P/gone; jq -nc --arg p $p --arg nm "$(name $p)" '{peer: $p, name: $nm, event: "gone"}' }
+      grep -q -i -e 'not found' "$P/err" && { touch $P/gone; jq -nc --arg p $p --arg nm "$(name $p)" '{peer: $p, name: $nm, event: "gone"}' }
       continue
     }
     head=$(git -C $P/repo rev-parse -q --verify origin/HEAD) || continue
@@ -113,13 +113,23 @@ pass() {
     nm=$(jq -r 'select(.id == 0) | .name' $P/all.new)
     for ch via in all all $me direct; do
       new=; [[ -e $P/$ch.jsonl ]] || { new=1; touch $P/$ch.jsonl }
-      grep -vxFf $P/$ch.jsonl $P/$ch.new | { [[ -n $new && $via == all ]] && tail -n 20 || cat } |
+      {
+        if [[ -s $P/$ch.jsonl ]]; then
+          grep -F -x -v -f "$P/$ch.jsonl" "$P/$ch.new"
+        else cat "$P/$ch.new"; fi
+      } | {
+        if [[ -n $new && $via == all ]]; then
+          jq -sc 'length as $n | to_entries[]
+            | select(.key >= ($n - 20) or .value.type == "hello"
+              or (.value.type == "claim" and (.value.state // "active") == "active")) | .value'
+        else cat; fi
+      } |
         jq -c --arg p $p --arg nm "$nm" --arg via $via "$EV ev"
       mv $P/$ch.new $P/$ch.jsonl
     done
     [[ $(jq -r 'select(.id == 0) | .state' $P/all.jsonl) == gone ]] && touch $P/gone
     for q in $(jq -r 'select(.id == 0) | .peers[]?' $P/all.jsonl); do
-      [[ $q == [0-9a-f]## && $q != $me ]] && ! grep -qxF $q $D/roster && {
+      [[ $q == [0-9a-f]## && $q != $me ]] && ! grep -F -x -q -e "$q" "$D/roster" && {
         print $q >> $D/roster
         jq -nc --arg p $p --arg nm "$nm" --arg q $q '{peer: $p, name: $nm, event: "introduced", new_peer: $q}'
       }
@@ -133,7 +143,7 @@ init)
   lock
   [[ -s $D/me ]] && me=$(<$D/me)
   if [[ -n $me ]]; then
-    code=$(gh api -i gists/$me --silent 2>/dev/null | head -1 | cut -d' ' -f2)
+    code=$(gh api -i gists/$me --silent 2>/dev/null | head -n 1 | cut -d' ' -f2)
     case $code in
       200) [[ -d $D/out/.git ]] || clone $me; print $me; exit ;;
       404) echo "gistalk: gist $me no longer exists; creating a new one" >&2; rm -f $D/me ;;
@@ -180,7 +190,7 @@ send)
   fi
   lock
   f=$D/out/$to.jsonl line=${id[2]-}
-  [[ -z $line && -n ${re[2]-} && -e $f ]] && line=$(jq --argjson r $re[2] 'select(.re == $r) | .id' $f | tail -1)
+  [[ -z $line && -n ${re[2]-} && -e $f ]] && line=$(jq --argjson r $re[2] 'select(.re == $r) | .id' $f | tail -n 1)
   if [[ -n $line ]]; then
     [[ -e $f ]] && jq -e --argjson i $line 'select(.id == $i)' $f > /dev/null || die 5 "you have no line $line in ${f:t}"
   else
@@ -192,7 +202,8 @@ send)
   if [[ -n $line ]]; then edit $f $line $o
   else
     line=$(nextid)
-    jq -c --argjson i $line --arg t ${${re[2]:+reply}:-msg} '{id: $i, type: $t} + .' <<< $o >> $f
+    jq -c --argjson i $line --arg t ${${re[2]:+reply}:-msg} '{id: $i, type: $t} + .
+      | if .type == "claim" and .state == null then .state = "active" else . end' <<< $o >> $f
   fi
   flush || exit
   print $line ;;

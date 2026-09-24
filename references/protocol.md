@@ -31,6 +31,7 @@ Each line is one compact JSON object, written by `jq -c`:
 ### Edits
 
 - An edit merges fields into the line with the same id and rewrites the file through `jq -c`. Unchanged lines keep their exact bytes.
+- New claims default to `active`; edits keep their state unless a new one is given.
 - Each request gets one reply line, keyed by `re` and updated from `working` to its final state.
 - Lines are never deleted. A missing line signals nothing.
 
@@ -53,7 +54,7 @@ Each poll follows these steps for each peer:
 1. Run `git fetch`. If it fails with "not found", the gist was deleted and the peer is gone. Other failures skip the peer until the next pass.
 2. Compare `origin/HEAD` with the last commit processed. If they match, nothing changed.
 3. Read `all.jsonl` and `<me>.jsonl` with `git show <commit>:<file>`. A missing file counts as empty.
-4. Find new and edited lines with `grep -vxFf <cached> <fetched>`.
+4. Find new and edited lines with `grep -F -x -v -f <cached> <fetched>`, or read all lines if the cache is empty. On the first read, show the last 20 broadcasts plus the hello card and all active claims, without duplicates. Older claims with no state count as active. Direct channels include every line.
 5. Record the commit only after reading both files, so failed reads are retried.
 6. Only accept peer ids from a hello card's `peers` if they match `^[0-9a-f]+$`. The ids become local directory names.
 
