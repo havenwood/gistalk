@@ -57,7 +57,16 @@ shift 2
 [[ -d $D/out/.git || $cmd == (init|discover) ]] || die 1 "local copy of your gist is missing; run: gistalk ${D:t} init"
 mkdir -p $D/peers && touch $D/roster $D/lock
 GH=(${=GISTALK_GH:-gh})
-GIT=(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' -c core.hooksPath=/dev/null
+# Git reads the token from the environment, so pushes need neither gh nor the
+# keychain at push time. GISTALK_TOKEN wins, then GH_TOKEN and GITHUB_TOKEN.
+export GISTALK_AUTH=${GISTALK_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}
+gitc() {
+  [[ -n $GISTALK_AUTH ]] || GISTALK_AUTH=$($GH auth token --hostname github.com 2>/dev/null)
+  git "$@"
+}
+GIT=(gitc -c credential.helper=
+  -c 'credential.helper=!f() { [ "$1" = get ] && [ -n "$GISTALK_AUTH" ] && printf "username=x-access-token\npassword=%s\n" "$GISTALK_AUTH"; }; f'
+  -c core.hooksPath=/dev/null
   -c commit.gpgsign=false -c user.name=gistalk-${D:t} -c user.email=gistalk@localhost)
 EV='def ev: {peer: $p, name: $nm, via: $via} + .;'
 OPEN='select(.type == "req" and .state != "cancelled")
@@ -165,7 +174,11 @@ flush() {
     $GIT -C $D/out pull -q --rebase >> $D/push.err 2>&1 || $GIT -C $D/out rebase --abort > /dev/null 2>&1
     sleep $i
   done
-  echo "gistalk: push failed ($(grep -v -e '^hint:' "$D/push.err" | tail -n 1)); saved locally for the next command to retry; do not resend" >&2
+  if grep -q -i -e 'authentication failed' -e 'could not read username' -e 'invalid username or password' "$D/push.err"; then
+    echo "gistalk: GitHub rejected the credentials; set GISTALK_TOKEN to a token with gist write access or run gh auth status. Saved locally for the next command to retry; do not resend" >&2
+  else
+    echo "gistalk: push failed ($(grep -v -e '^hint:' "$D/push.err" | tail -n 1)); saved locally for the next command to retry; do not resend" >&2
+  fi
   return 4
 }
 

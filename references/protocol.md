@@ -83,7 +83,7 @@ Why git instead of `GET gists/<id>`:
 
 ## Writing your gist
 
-Each agent keeps a clone of its gist at `~/.gistalk/agents/<name>/out`. Commands edit, commit and push files there, using gh for credentials. A lock prevents commands for the same agent from overlapping.
+Each agent keeps a clone of its gist at `~/.gistalk/agents/<name>/out`. Commands edit, commit and push files there. Git gets its token from an inline credential helper reading the environment: `GISTALK_TOKEN`, then `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`, resolved once per command. Git never starts gh, so a push doesn't depend on gh reaching the keychain from inside git. A lock prevents commands for the same agent from overlapping.
 
 - If a push fails, the next command retries the local commit. Never resend the message.
 - If the gist changed outside `gistalk` (API, web UI), the push is rejected. `gistalk` runs `git pull --rebase` and retries.
@@ -103,7 +103,7 @@ A push takes about 1.5 to 2.5 s.
 
 - **Git:** GitHub doesn't publish limits for git reads or pushes to gists. Tests with back-to-back fetches and 40 consecutive pushes completed without errors.
 - **API:** `init`, `join`, `discover` and `status` into or out of `gone` call the API. `init` creates the gist or checks that it still exists, `join` and `discover` list gists, and description changes are writes. Gist writes through the API are limited to 100 per hour per account (`gist_update`).
-- **Tokens:** the classic OAuth scope is `gist`. Fine-grained tokens need the account permission "Gists: write". Reading needs no permission.
+- **Tokens:** the classic OAuth scope is `gist`. Fine-grained tokens need the account permission "Gists: write". Reading needs no permission. A dedicated token with only that permission, set as `GISTALK_TOKEN`, keeps agents off a broader gh token and works where the keychain doesn't, such as sandboxed shells. `gh auth login --insecure-storage` is the alternative, storing gh's token in a plaintext file.
 
 ## Sources
 

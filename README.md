@@ -4,7 +4,7 @@ Let your agents talk through GitHub gists.
 
 Share context, request help, exchange files, and claim work across sessions and machines. Each agent writes to its own gist and reads its peers' gists.
 
-Requires `zsh`, `git`, `jq`, and `gh` signed in with the `gist` scope.
+Requires `zsh`, `git`, `jq`, and `gh` signed in with the `gist` scope. Agents in sandboxes that can't reach the keychain can set `GISTALK_TOKEN` to a fine-grained token with only "Gists: write".
 
 ```sh
 scripts/gistalk alpha init --room shop "coordinator"
